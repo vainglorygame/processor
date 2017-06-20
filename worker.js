@@ -247,6 +247,7 @@ function flatten(obj) {
                     { name: player.name, region: player.shard_id });
                 const duplicate = player_records_direct.find((pr) =>
                     pr.api_id == player.api_id);
+                if (duplicate == undefined) return;  // TODO wtf???
                 if (duplicate.created_at < player.created_at) {
                     // replace by newer one as below
                     player_records_direct.splice(
