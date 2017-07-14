@@ -13,11 +13,7 @@ const amqp = require("amqplib"),
     winston = require("winston"),
     loggly = require("winston-loggly-bulk"),
     Seq = require("sequelize"),
-    api_name_mappings = require("../orm/mappings").map,
-    isAbility = require("../orm/mappings").isAbility,
-    isItem = require("../orm/mappings").isItem,
-    isHero = require("../orm/mappings").isHero,
-    sleep = require("sleep-promise");
+    api_name_mappings = require("../orm/mappings").map;
 
 const RABBITMQ_URI = process.env.RABBITMQ_URI,
     DATABASE_URI = process.env.DATABASE_URI,
@@ -69,8 +65,9 @@ function snakeCaseKeys(obj) {
     return obj;
 }
 
-// split an array into arrays of max chunksize
-function* chunks(arr) {
+// split an Set() into arrays of max chunksize
+function* chunks(data) {
+    const arr = [...data];  // TODO maybe slice the Set?
     for (let c=0, len=arr.length; c<len; c+=CHUNKSIZE)
         yield arr.slice(c, c+CHUNKSIZE);
 }
@@ -91,28 +88,26 @@ function flatten(obj) {
     return snakeCaseKeys(o);
 }
 
-// main code
-(async () => {
-    let seq, model, rabbit, ch;
+amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
+    global.process.on("SIGINT", () => {
+        rabbit.close();
+        global.process.exit();
+    });
 
     // connect to rabbit & db
-    while (true) {
-        try {
-            seq = new Seq(DATABASE_URI, {
-                logging: false,
-                max: MAXCONNS
-            });
-            rabbit = await amqp.connect(RABBITMQ_URI, { heartbeat: 120 });
-            ch = await rabbit.createChannel();
-            await ch.assertQueue(QUEUE, {durable: true});
-            break;
-        } catch (err) {
-            logger.error("Error connecting", err);
-            await sleep(5000);
-        }
-    }
+    const seq = new Seq(DATABASE_URI, {
+        //logging: false,
+        max: MAXCONNS
+    });
 
-    model = require("../orm/model")(seq, Seq);
+    const ch = await rabbit.createChannel();
+    await ch.assertQueue(QUEUE, { durable: true });
+    await ch.assertQueue(QUEUE + "_failed", { durable: true });
+    // as long as the queue is filled, msg are not ACKed
+    // server sends as long as there are less than `prefetch` unACKed
+    await ch.prefetch(BATCHSIZE);
+
+    const model = require("../orm/model")(seq, Seq);
 
     // performance logging
     let load_timer = undefined,
@@ -124,8 +119,7 @@ function flatten(obj) {
         hero_db_map = new Map(),      // "*SAW*" to id
         series_db_map = new Map(),    // date to series id
         game_mode_db_map = new Map(), // "ranked" to id
-        role_db_map = new Map(),      // "captain" to id
-        hero_role_map = new Map();    // SAW.id to "carry"
+        role_db_map = new Map();      // "captain" to id
 
     // populate maps
     await Promise.all([
@@ -143,44 +137,61 @@ function flatten(obj) {
         model.Role.findAll()
             .map((role) => role_db_map.set(role.name, role.id))
     ]);
-
-    // as long as the queue is filled, msg are not ACKed
-    // server sends as long as there are less than `prefetch` unACKed
-    await ch.prefetch(BATCHSIZE);
+    if (item_db_map.size == 0 ||
+        hero_db_map.size == 0 ||
+        series_db_map.size == 0 ||
+        game_mode_db_map.size == 0 ||
+        role_db_map == 0) {
+        logger.error("mapping tables are not seeded!!! quitting");
+        global.process.exit();
+    }
 
     // buffers that will be filled until BATCHSIZE is reached
     // to make db transactions more efficient
     let player_data = new Set(),
         match_data = new Set(),
-        telemetry_data = new Set(),
         msg_buffer = new Set();
 
     ch.consume(QUEUE, async (msg) => {
-        if (msg.properties.type == "player") {
-            // bridge sends a single object
-            player_data.add(JSON.parse(msg.content));
-            msg_buffer.add(msg);
-        }
-        if (msg.properties.type == "match") {
-            // apigrabber sends a single object
-            const match = JSON.parse(msg.content);
-            // deduplicate and reject immediately
-            if (await model.Match.count({ where: { api_id: match.id } }) > 0) {
-                if (msg.properties.headers.notify != undefined) {
-                    await ch.publish("amq.topic",
-                        msg.properties.headers.notify,
-                        new Buffer("matches_dupe"))
-                    // send match_dupe to web player.ign.api_id
-                    await ch.publish("amq.topic",
-                        msg.properties.headers.notify + "." + match.id,
-                        new Buffer("match_dupe"))
+        switch (msg.properties.type) {
+            case "player":
+                // bridge sends a single object
+                let player = JSON.parse(msg.content);
+                // player objects that arrive here came from a search
+                // with search, bridge can't update last_update
+                player.last_update = seq.fn("NOW");
+                player_data.add(player);
+                msg_buffer.add(msg);
+                break;
+            case "match":
+                // apigrabber sends a single object
+                const match = JSON.parse(msg.content);
+                // deduplicate and reject immediately
+                if (await model.Match.count({ where: { api_id: match.id } }) > 0) {
+                    if (msg.properties.headers.notify) {
+                        await ch.publish("amq.topic",
+                            msg.properties.headers.notify,
+                            new Buffer("matches_dupe"))
+                        // send match_dupe to web player.ign.api_id
+                        await ch.publish("amq.topic",
+                            msg.properties.headers.notify + "." + match.id,
+                            new Buffer("match_dupe"))
+                    }
+                    await ch.nack(msg, false, false);
+                } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
+                    // it is really `"null"`.
+                    // reject invalid matches (handling API bugs)
+                    await ch.nack(msg, false, false);
+                    await ch.sendToQueue(QUEUE + "_failed", msg.content, {
+                        persistent: true,
+                        headers: msg.properties.headers
+                    });
+                } else {
+                    // all good
+                    match_data.add(match);
+                    msg_buffer.add(msg);
                 }
-            } else match_data.add(match);
-            msg_buffer.add(msg);
-        }
-        if (msg.properties.type == "telemetry") {
-            telemetry_data.add(JSON.parse(msg.content));
-            msg_buffer.add(msg);
+                break;
         }
 
         // fill queue until batchsize or idle
@@ -188,108 +199,136 @@ function flatten(obj) {
         if (profiler == undefined) profiler = logger.startTimer();
         // timeout after first job
         if (load_timer == undefined)
-            load_timer = setTimeout(process, LOAD_TIMEOUT);
+            load_timer = setTimeout(tryProcess, LOAD_TIMEOUT);
         // timeout after last job
         if (idle_timer != undefined)
             clearTimeout(idle_timer);
-        idle_timer = setTimeout(process, IDLE_TIMEOUT);
+        idle_timer = setTimeout(tryProcess, IDLE_TIMEOUT);
         // maximum data pressure
-        if (match_data.size + player_data.size + telemetry_data.size == BATCHSIZE)
-            await process();
+        if (match_data.size + player_data.size == BATCHSIZE)
+            await tryProcess();
     }, { noAck: false });
 
-    // finish a whole batch
-    async function process() {
+    // wrap process() in message handler
+    async function tryProcess() {
+        const msgs = new Set(msg_buffer);
+        msg_buffer.clear();
+
         profiler.done("buffer filled");
         profiler = undefined;
 
         logger.info("processing batch", {
             players: player_data.size,
-            matches: match_data.size,
-            telemetries: telemetry_data.size
+            matches: match_data.size
         });
 
         // clean up to allow processor to accept while we wait for db
         clearTimeout(idle_timer);
         clearTimeout(load_timer);
-        const player_objects = new Set(player_data),
-            match_objects = new Set(match_data),
-            telemetry_objects = new Set(telemetry_data),
-            msgs = new Set(msg_buffer);
         idle_timer = undefined;
         load_timer = undefined;
+
+        if (player_data.size + match_data.size == 0) {
+            logger.info("buffers empty, nothing to do");
+            return;
+        }
+
+        const player_objects = new Set(player_data),
+            match_objects = new Set(match_data);
         player_data.clear();
         match_data.clear();
-        telemetry_data.clear();
-        msg_buffer.clear();
 
-        const processed_players = new Set(); // to sort out duplicates
+        try {
+            await process(player_objects, match_objects);
 
+            logger.info("acking batch", { size: msgs.size });
+            await Promise.map(msgs, async (m) => await ch.ack(m));
+
+            // notify web
+            await Promise.map(msgs, async (m) => {
+                if (m.properties.headers.notify == undefined) return;
+                let notif = "";
+                switch (m.properties.type) {
+                    // new match
+                    case "match":
+                        notif = "matches_update";
+                        // notify player.name.api_id about match_update
+                        await Promise.map(match_objects, async (mat) =>
+                            await ch.publish("amq.topic",
+                                m.properties.headers.notify + "." + mat.id,
+                                new Buffer("match_update"))
+                        );
+                        await ch.publish("amq.topic", m.properties.headers.notify,
+                            new Buffer("match_update"));
+                        break;
+                    case "player":
+                        // player obj updated
+                        notif = "stats_update";
+                        break;
+                }
+            });
+            // …global about new matches
+            if (match_objects.length > 0)
+                await ch.publish("amq.topic", "global", new Buffer("matches_update"));
+            // notify follow up services
+            if (DOANALYZEMATCH)
+                await Promise.each(match_objects, async (m) =>
+                    await ch.sendToQueue(ANALYZE_QUEUE, new Buffer(m.id),
+                        { persistent: true }));
+        } catch (err) {
+            if (err instanceof Seq.TimeoutError) {
+                // deadlocks / timeout
+                logger.error("SQL error", err);
+                await Promise.map(msgs, async (m) =>
+                    await ch.nack(m, false, true));  // retry
+            } else {
+                // log, move to error queue and NACK
+                logger.error(err);
+                await Promise.map(msgs, async (m) => {
+                    await ch.sendToQueue(QUEUE + "_failed", m.content, {
+                        persistent: true,
+                        headers: m.properties.headers
+                    });
+                    await ch.nack(m, false, false);
+                });
+            }
+        }
+    }
+
+    // finish a whole batch
+    async function process(player_objects, match_objects) {
         // aggregate record objects to do a bulk insert
-        let match_records = [],
-            roster_records = [],
-            participant_records = [],
-            participant_stats_records = [],
-            participant_phase_records = [],  // Telemetry
-            player_records = [],
-            player_records_direct = [],  // via `/players`
-            asset_records = [];
+        let match_records = new Set(),
+            roster_records = new Set(),
+            participant_records = new Set(),
+            participant_stats_records = new Set(),
+            players = new Map(),
+            player_records = new Set(),
+            player_records_dates = new Set(),  // from /players
+            asset_records = new Set();
 
         // populate `_records`
         // data from `/players`
-        // `each` executes serially so there are
-        // no race conditions within one batch
-        await Promise.each(player_objects, async (p) => {
-            const player = flatten(p);
-            if (processed_players.has(player.api_id)) {
-                // duplicate within one batch
-                logger.warn("got player in additional region",
-                    { name: player.name, region: player.shard_id });
-                const duplicate = player_records_direct.find((pr) =>
-                    pr.api_id == player.api_id);
-                if (duplicate == undefined) return;  // TODO wtf???
-                if (duplicate.created_at < player.created_at) {
-                    // replace by newer one as below
-                    player_records_direct.splice(
-                        player_records_direct.indexOf(duplicate), 1);
-                } else {
-                    logger.warn("ignoring player from additional region",
-                        { name: player.name, region: player.shard_id });
-                    return;
-                }
-            } else {
-                processed_players.add(player.api_id);
-            }
-            // player objects that arrive here came from a search
-            // with search, updater can't update last_update
-            player.last_update = seq.fn("NOW");
+        player_objects.forEach((p) => {
+            let player = flatten(p);
+            player.created_at = new Date(Date.parse(player.created_at));
+
             logger.info("processing player",
                 { name: player.name, region: player.shard_id });
-            // duplicate in batch and db
-            // check whether there is a player in db
-            // that has a more recent `created_at`
-            // this is only the case with region changes
-            const count = await model.Player.count({ where: {
-                api_id: player.api_id,
-                created_at: {
-                    $gt: player.created_at // equal: just update last_update
+            if (!players.has(player.api_id)) {
+                players.set(player.api_id, player);
+            } else { // or a player object that is more recent than the buffer's
+                if (players.get(player.api_id).created_at < player.created_at) {
+                    logger.info("buffer has same more recent direct player object, overwriting");
+                    players.set(player.api_id, player);
                 }
-            }});
-            if (count > 0) {
-                logger.warn("ignoring player who seems to have switched from region",
-                    { name: player.name, region: player.shard_id });
-                return;
-            } else player_records_direct.push(player);
-        });
-
-        // reject invalid matches (handling API bugs) TODO should happen in apigrabber
-        match_objects.forEach((match, idx) => {
-            // it is really `"null"`.
-            if (match.rosters[0].id == "null") delete match_objects[idx];
+            }
         });
 
         // data from `/matches`
         match_objects.forEach((match) => {
+            match.created_at = new Date(Date.parse(match.created_at));
+
             // flatten jsonapi nested response into our db structure-like shape
             // also, push missing fields
             match.rosters = match.rosters.map((roster) => {
@@ -338,7 +377,12 @@ function flatten(obj) {
                         Object.keys(pas.itemSells)
                             .map((key) => item_id(key) + ";" + pas.itemSells[key]).join(",");
 
-                    participant.player.attributes.shardId = participant.player.attributes.shardId || participant.attributes.shardId;
+                    participant.player.attributes.shardId = participant.player.attributes.shardId
+                        || participant.attributes.shardId;
+                    if (participant.player.attributes.createdAt)
+                        participant.player.createdAt =
+                            new Date(Date.parse(participant.player.attributes.createdAt));
+                    else participant.player.created_at = match.createdAt;
                     participant.player = flatten(participant.player);
                     return flatten(participant);
                 });
@@ -352,476 +396,128 @@ function flatten(obj) {
             match = flatten(match);
 
             // after conversion, create the array of records
-            match_records.push(match);
+            match_records.add(match);
             match.rosters.forEach((r) => {
-                roster_records.push(r);
+                roster_records.add(r);
                 r.participants.forEach((p) => {
                     const p_pstats = calculate_participant_stats(match, r, p);
                     // participant gets split into participant and p_stats
-                    participant_records.push(p_pstats[0]);
-                    participant_stats_records.push(p_pstats[1]);
-                    // deduplicate player
-                    // in a batch, it is very likely that players are duplicated
-                    // so this improves performance a bit
-                    if (!processed_players.has(p.player.api_id)) {
-                        processed_players.add(p.player.api_id);
-                        player_records.push(p.player);
+                    participant_records.add(p_pstats[0]);
+                    participant_stats_records.add(p_pstats[1]);
+
+                    // if match.included has an unknown player
+                    if (!players.has(p.player.api_id))
+                        players.set(p.player.api_id, p.player);
+                    else {
+                        // or a player object that is more recent than the buffer's
+                        if (players.get(p.player.api_id).created_at < p.player.created_at) {
+                            if (players.get(p.player.api_id).last_update != undefined) {
+                                logger.info("buffer has same more recent indirect player object, overwriting direct");
+                                // indirect overwrites direct's stats; keep last_update and created_at
+                                p.player.created_at = players.get(p.player.api_id).created_at;
+                                p.player.last_update = players.get(p.player.api_id).last_update;
+                            }
+                            // else direct/indirect overwrites indirect
+                            players.set(p.player.api_id, p.player);
+                        }
                     }
                 });
             });
-            match.assets.forEach((a) => asset_records.push(a));
+            match.assets.forEach((a) => asset_records.add(a));
         });
 
-
-        // data from Telemetry, one phase (early/mid/late/…) per obj
-        await Promise.map(telemetry_objects, async (telemetry) => {
-            if (telemetry.data.length == 0) return;  // TODO rm me
-            // api -> telemetry format
-            const sideToTeam = (s) => s == "left/blue"? "Left" : "Right",
-                // yes there is yet another format and yes it's strings
-                sideToTeamNo = (s) => s == "left/blue"? "1" : "2";
-            // get match participant references
-            const participants = await model.Participant.findAll({
-                where: { match_api_id: telemetry.match_api_id },
-                include: [ {  // TODO rm once pushed to participant
-                    model: model.Roster,
-                    attributes: [ "side" ]
-                } ]
-            }).map((p) => { return {
-                api_id: p.api_id,
-                player_api_id: p.player_api_id,
-                actor: p.actor,
-                team: sideToTeam(p.roster.side),
-                teamNo: sideToTeamNo(p.roster.side)
+        // player.last_update = last time bridge ran an update
+        // player.created_at = last match's created_at
+        //      that has been added to the database after fetching full history
+        // Here, all attributes *except* these two will be overwritten
+        //      if they are more recent in match.included data
+        await Promise.map(players.values(), async (player) => {
+            const count = await model.Player.count({ where: {
+                api_id: player.api_id,
+                created_at: { $gt: player.created_at }
             } });
-
-            // seconds since epoch; first spawn time
-            const matchstart = new Date(Date.parse(telemetry.match_start)).getTime() / 1000;
-
-            // link participant <-> Telemetry actor/target
-            // available as `.actor` or as `.target`
-            telemetry.data.forEach((t) => {
-                // seconds after this phase's start
-                t.offset = new Date(Date.parse(t.time)).getTime() / 1000 - matchstart;
-
-                // linking
-                if (t.type == "HeroSelect")
-                    t.actor = participants.filter((p) =>
-                        p.player_api_id == t.payload.Player)[0];
-                if (t.type == "BuyItem"
-                    || t.type == "SellItem"
-                    || t.type == "UseItemAbility"
-                    || t.type == "LearnAbility"
-                    || t.type == "UseAbility"
-                    || t.type == "LevelUp")
-                    t.actor = participants.filter((p) =>
-                        p.actor == t.payload.Actor
-                        && p.team == t.payload.Team)[0];
-                if (t.type == "UseItemAbility"
-                    || t.type == "UseAbility")
-                    t.target = participants.filter((p) =>
-                        p.actor == t.payload.TargetActor
-                        && p.team != t.payload.Team)[0];
-                // damage actor
-                if ((t.type == "DealDamage"
-                     || t.type == "KillActor")
-                    && t.payload.IsHero == 1)
-                    t.actor = participants.filter((p) =>
-                        p.actor == t.payload.Actor
-                        && p.team == t.payload.Team)[0];
-                // damage target
-                if (t.type == "DealDamage"
-                    && t.payload.TargetIsHero == 1)
-                    t.target = participants.filter((p) =>
-                        p.actor == t.payload.Target
-                        && p.team != t.payload.Team)[0];
-                // kill target
-                if (t.type == "KillActor"
-                    && t.payload.TargetIsHero == 1)
-                    t.target = participants.filter((p) =>
-                        p.actor == t.payload.Killed
-                        && p.team == t.payload.KilledTeam)[0];
-            });
-            /*
-            telemetry.data.forEach((ev) => {  // TODO debug
-                if (ev.payload.Ability == undefined || ev.payload.IsHero == 0) return;
-                if (!api_name_mappings.has(ev.payload.Ability))
-                    console.error("ab to name map missing", ev.payload.Ability);
-            });
-            */
-            const participants_phase = participants.map((p) => { return {
-                // TODO ban data workaround
-                start: telemetry.start < 0? 0 : telemetry.start,  // in seconds
-                end: telemetry.end,
-                participant_api_id: p.api_id,
-
-                kills: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ev.payload.IsHero == 1
-                    && ev.payload.TargetIsHero == 1
-                ).length,
-                deaths: telemetry.data.filter((ev) =>
-                    ev.target == p
-                    && ev.type == "KillActor"
-                    && ev.payload.TargetIsHero == 1
-                ).length,
-                // assists missing in data
-                minion_kills: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ["*JungleMinion_TreeEnt*",
-                        "*Neutral_JungleMinion_DefaultBig*",
-                        "*Neutral_JungleMinion_DefaultSmall*",
-                        "*LeadMinion*",
-                        "*RangedMinion*",
-                        "*TankMinion*"
-                    ].indexOf(ev.payload.Killed) != -1
-                ).length,
-                jungle_kills: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ["*JungleMinion_TreeEnt*",
-                        "*Neutral_JungleMinion_DefaultBig*",
-                        "*Neutral_JungleMinion_DefaultSmall*"
-                    ].indexOf(ev.payload.Killed) != -1
-                ).length,
-                non_jungle_minion_kills: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ["*LeadMinion*",
-                        "*RangedMinion*",
-                        "*TankMinion*"
-                    ].indexOf(ev.payload.Killed) != -1
-                ).length,
-                crystal_mine_captures: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ev.payload.Killed == "*JungleMinion_CrystalMiner*"
-                ).length,
-                gold_mine_captures: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ev.payload.Killed == "*JungleMinion_GoldMiner*"
-                ).length,
-                kraken_captures: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && ev.payload.Killed == "*Kraken_Jungle*"
-                ).length,
-                turret_captures: telemetry.data.filter((ev) =>
-                    ev.actor == p
-                    && ev.type == "KillActor"
-                    && (ev.payload.Killed == "*Turret*"
-                        || ev.payload.Killed == "*VainTurret*")
-                ).length,
-                // TODO Telemetry does not give accurate LifetimeGold
-                gold: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "LevelUp"
-                    && ev.payload.LifetimeGold > acc
-                    ? ev.payload.LifetimeGold
-                    : acc
-                , null),
-                dmg_true_hero: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.TargetIsHero == 1
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_true_kraken: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ["*Kraken_Jungle*",
-                        "*Kraken_Captured*"
-                    ].indexOf(ev.payload.Target) != -1
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_true_turret: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.Target == "*Turret*"
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_true_vain_turret: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.Target == "*VainTurret*"
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_true_others: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.TargetIsHero == 0
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_dealt_hero: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.TargetIsHero == 1
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_dealt_kraken: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ["*Kraken_Jungle*",
-                        "*Kraken_Captured*"
-                    ].indexOf(ev.payload.Target) != -1
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_dealt_turret: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.Target == "*Turret*"
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_dealt_vain_turret: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.Target == "*VainTurret*"
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_dealt_others: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.TargetIsHero == 0
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_rcvd_dealt_hero: telemetry.data.reduce((acc, ev) =>
-                    ev.target == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.IsHero == 1
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_rcvd_true_hero: telemetry.data.reduce((acc, ev) =>
-                    ev.target == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.IsHero == 1
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                dmg_rcvd_dealt_others: telemetry.data.reduce((acc, ev) =>
-                    ev.target == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.IsHero == 0
-                    ? acc + ev.payload.Delt
-                    : acc
-                , 0),
-                dmg_rcvd_true_others: telemetry.data.reduce((acc, ev) =>
-                    ev.target == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.IsHero == 0
-                    ? acc + ev.payload.Damage
-                    : acc
-                , 0),
-                hero_level: telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "LevelUp"
-                    && ev.payload.Level > acc
-                    ? ev.payload.Level
-                    : acc
-                , -1),
-                items: null,  // TODO
-                item_grants: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "BuyItem"
-                    ? acc.concat(item_db_map.get(api_name_mappings.get(ev.payload.Item)))
-                    : acc
-                , [])),
-                item_sells: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "SellItem"
-                    ? acc.concat(item_db_map.get(api_name_mappings.get(ev.payload.Item)))
-                    : acc
-                , [])),
-                ability_levels: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "LearnAbility"
-                    ? acc.concat([ [ api_name_mappings.get(ev.payload.Ability).split(" ")[1],
-                        ev.offset ] ])
-                    : acc
-                , [])),
-                ability_uses: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "UseAbility"
-                    && ["A", "B", "C"].indexOf(
-                        api_name_mappings.get(ev.payload.Ability).split(" ")[1]
-                    ) != -1
-                    ? acc.concat([ [ api_name_mappings.get(ev.payload.Ability).split(" ")[1],
-                        ev.offset ] ])
-                    : acc
-                , [])),
-                ability_damage: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "DealDamage"
-                    && ev.payload.IsHero == 1
-                    && isAbility(ev.payload.Source)  // TODO
-                    && api_name_mappings.has(ev.payload.Source)
-                    && ["A", "B", "C"].indexOf(
-                        api_name_mappings.get(ev.payload.Source).split(" ")[1]
-                    ) != -1  // TODO refactor here
-                    ? acc.concat([ [ api_name_mappings.get(ev.payload.Source).split(" ")[1],
-                          ev.payload.Damage, ev.offset ] ])
-                    : acc
-                , [])),
-                item_uses: JSON.stringify(telemetry.data.reduce((acc, ev) =>
-                    ev.actor == p
-                    && ev.type == "UseItemAbility"
-                    ? acc.concat([ [ item_db_map.get(api_name_mappings.get(ev.payload.Ability)),
-                          ev.offset ] ])
-                    : acc
-                , [])),
-                player_damage: null,  // TODO
-                items: null,  // TODO
-                draft_position: telemetry.data.filter((ev) =>
-                    ev.type == "HeroSelect").indexOf(
-                        telemetry.data.filter((ev) =>
-                            ev.type == "HeroSelect"
-                            && ev.actor == p)[0]),
-                ban: hero_db_map.get(api_name_mappings.get(
-                    telemetry.data
-                        .filter((ev) => ev.type == "HeroBan" &&
-                            ev.payload.Team == p.teamNo)
-                        .map((sel) => sel.payload.Hero)[0]  // can be null
-                )),
-                pick: hero_db_map.get(api_name_mappings.get(
-                    telemetry.data
-                        .filter((ev) =>
-                            ev.type == "HeroSelect"
-                            && ev.actor == p)
-                        .map((sel) => sel.payload.Hero)[0]  // can be null
-                )),// traits calculated later
-            } });
-            participant_phase_records = participant_phase_records.concat(
-                participants_phase);  // TODO calc stats
+            // update requested from bridge sets both created_at and last_update
+            if (player.last_update == undefined) {
+                // this will not overwrite last_update and created_at
+                if (count == 0) player_records.add(player);
+                // else db is more recent than buffer, skip
+            } else {
+                // this will overwrite dates
+                player_records_dates.add(player);
+            }
         });
 
         let transaction_profiler = logger.startTimer();
         // now access db
-        try {
-            // upsert whole batch in parallel
-            logger.info("inserting batch into db");
-            await seq.transaction({ autocommit: false }, async (transaction) => {
-                await Promise.map(chunks(match_records), async (m_r) =>
-                    model.Match.bulkCreate(m_r, {
-                        ignoreDuplicates: true,  // if this happens, something is wrong
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(roster_records), async (r_r) =>
-                    model.Roster.bulkCreate(r_r, {
-                        ignoreDuplicates: true,
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(participant_records), async (p_r) =>
-                    model.Participant.bulkCreate(p_r, {
-                        ignoreDuplicates: true,
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(participant_stats_records), async (p_s_r) =>
-                    model.ParticipantStats.bulkCreate(p_s_r, {
-                        ignoreDuplicates: true,
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(participant_phase_records), async (p_p_r) =>
-                    model.ParticipantPhases.bulkCreate(p_p_r, {
-                        /* ignoreDuplicates: true, TODO DEBUG */
-                        ignoreDuplicates: false,
-                        updateOnDuplicate: [],
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(player_records), async (pl_r) =>
-                    model.Player.bulkCreate(pl_r, {
-                        ignoreDuplicates: true,
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(player_records_direct), async (p_r_d) =>
-                    model.Player.bulkCreate(player_records_direct, {
-                        // if set to [] (all), upsert messes with autoincrement
-                        updateOnDuplicate: [
-                            "shard_id", "api_id", "name", "last_update",
-                            "created_at", "level", "xp", "lifetime_gold",
-                            "skill_tier"
-                        ],
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-                await Promise.map(chunks(asset_records), async (a_r) =>
-                    model.Asset.bulkCreate(a_r, {
-                        ignoreDuplicates: true,
-                        transaction: transaction
-                    }), { concurrency: MAXCONNS }
-                );
-            });
-
-            logger.info("acking batch", { size: msgs.size });
-            await Promise.map(msgs, async (m) => await ch.ack(m));
-        } catch (err) {
-            // this should only happen for Deadlocks in prod
-            // it *must not* fail due to broken schema or missing dependency
-            // TODO: eliminate such cases earlier in the chain
-            // and immediately NACK those broken matches, requeueing only the rest
-            logger.error("SQL error", err);
-            await Promise.map(msgs, async (m) => await ch.nack(m, false, true));
-            return;  // give up
-        }
-        transaction_profiler.done("database transaction");
-
-        // notify web
-        await Promise.map(msgs, async (m) => {
-            if (m.properties.headers.notify == undefined) return;
-            let notif = "error";
-            // new match
-            if (m.properties.type == "match") {
-                notif = "matches_update";
-                // TODO this sends match_update for every match in the batch to every player
-                // notify player.name.api_id about match_update
-                await Promise.map(match_records, async (mat) =>
-                    await ch.publish("amq.topic",
-                        m.properties.headers.notify + "." + mat.api_id,
-                        new Buffer("match_update"))
-                );
-                await ch.publish("amq.topic", m.properties.headers.notify,
-                    new Buffer("match_update"));
-            }
-            // player obj updated
-            if (m.properties.type == "player") notif = "stats_update";
-            // new phases
-            if (m.properties.type == "telemetry") {
-                // notify match.api_id about phase_update
-                await ch.publish("amq.topic",
-                    m.properties.headers.notify,
-                    new Buffer("phase_update"))
-            }
-
-            if (m.properties.headers.donotify == true)  // TODO remove later
-                await ch.publish("amq.topic", m.properties.headers.notify,
-                    new Buffer(notif));
+        // upsert whole batch in parallel
+        logger.info("inserting batch into db");
+        await seq.transaction({ autocommit: false }, async (transaction) => {
+            await Promise.map(chunks(match_records), async (m_r) =>
+                model.Match.bulkCreate(m_r, {
+                    ignoreDuplicates: true,  // if this happens, something is wrong
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(roster_records), async (r_r) =>
+                model.Roster.bulkCreate(r_r, {
+                    ignoreDuplicates: true,
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(participant_records), async (p_r) =>
+                model.Participant.bulkCreate(p_r, {
+                    ignoreDuplicates: true,
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(participant_stats_records), async (p_s_r) =>
+                model.ParticipantStats.bulkCreate(p_s_r, {
+                    ignoreDuplicates: true,
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(player_records), async (p_r) =>
+                model.Player.bulkCreate(p_r, {
+                    fields: [
+                        // specify fields or Sequelize attempts to update all fields
+                        "api_id", "name", "shard_id",
+                        "skill_tier",
+                        "level", "lifetime_gold", "xp"
+                    ],
+                    updateOnDuplicate: [
+                        // only stats
+                        "api_id", "name", "shard_id",
+                        "skill_tier",
+                        "level", "lifetime_gold", "xp"
+                    ],
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(player_records_dates), async (p_r_d) =>
+                model.Player.bulkCreate(p_r_d, {
+                    fields: [
+                        "last_update", "created_at",
+                        "api_id", "name", "shard_id",
+                        "skill_tier",
+                        "level", "lifetime_gold", "xp"
+                    ],
+                    updateOnDuplicate: [
+                        "last_update", "created_at",
+                        "api_id", "name", "shard_id",
+                        "skill_tier",
+                        "level", "lifetime_gold", "xp"
+                    ],
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
+            await Promise.map(chunks(asset_records), async (a_r) =>
+                model.Asset.bulkCreate(a_r, {
+                    ignoreDuplicates: true,
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
         });
-        // …global about new matches
-        if (match_records.length > 0)
-            await ch.publish("amq.topic", "global", new Buffer("matches_update"));
-        // notify follow up services
-        if (DOANALYZEMATCH)
-            await Promise.each(match_records, async (m) =>
-                await ch.sendToQueue(ANALYZE_QUEUE, new Buffer(m.api_id),
-                    { persistent: true }));
+        transaction_profiler.done("database transaction");
     }
 
     // Split participant API data into participant and participant_stats
@@ -918,8 +614,9 @@ function flatten(obj) {
             return "carry";
         return "jungler";
     }
-})();
+});
 
-process.on("unhandledRejection", function(reason, promise) {
-    logger.error(reason);
+process.on("unhandledRejection", (err) => {
+    logger.error(err);
+    global.process.exit(1);  // fail hard and die
 });

@@ -1,0 +1,19 @@
+*** /tmp/a	2017-07-14 18:23:00.471411882 +0200
+--- node_modules/sequelize/lib/model.js	2017-07-14 18:25:01.281686417 +0200
+***************
+*** 2349,2360 ****
+--- 2349,2362 ----
+          }
+  
+          return this.QueryInterface.bulkInsert(this.getTableName(options), records, options, attributes).then(results => {
++ /*
+            if (Array.isArray(results)) {
+              results.forEach((result, i) => {
+                instances[i].set(this.primaryKeyAttribute, result[this.rawAttributes[this.primaryKeyAttribute].field], {raw: true});
+              });
+            }
+            return results;
++ */
+          });
+        }
+      }).then(() => {
