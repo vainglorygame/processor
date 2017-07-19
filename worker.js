@@ -312,12 +312,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         player_objects.forEach((p) => {
             let player = flatten(p);
             player.created_at = new Date(Date.parse(player.created_at));
+            player.last_match_created_date = player.created_at;
 
             logger.info("processing player",
                 { name: player.name, region: player.shard_id });
             if (!players.has(player.api_id)) {
                 players.set(player.api_id, player);
-            } else { // or a player object that is more recent than the buffer's
+            } else {  // or a player object that is more recent than the buffer's
                 if (players.get(player.api_id).created_at < player.created_at) {
                     logger.info("buffer has same more recent direct player object, overwriting");
                     players.set(player.api_id, player);
@@ -327,7 +328,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
         // data from `/matches`
         match_objects.forEach((match) => {
-            match.created_at = new Date(Date.parse(match.created_at));
+            match.createdAt = new Date(Date.parse(match.createdAt));
 
             // flatten jsonapi nested response into our db structure-like shape
             // also, push missing fields
@@ -379,10 +380,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
                     participant.player.attributes.shardId = participant.player.attributes.shardId
                         || participant.attributes.shardId;
-                    if (participant.player.attributes.createdAt)
-                        participant.player.createdAt =
+                    if (participant.player.attributes.createdAt != undefined)
+                        participant.player.attributes.createdAt =
                             new Date(Date.parse(participant.player.attributes.createdAt));
-                    else participant.player.created_at = match.createdAt;
+                    else participant.player.attributes.created_at = participant.createdAt;
                     participant.player = flatten(participant.player);
                     return flatten(participant);
                 });
@@ -413,9 +414,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         if (players.get(p.player.api_id).created_at < p.player.created_at) {
                             if (players.get(p.player.api_id).last_update != undefined) {
                                 logger.info("buffer has same more recent indirect player object, overwriting direct");
-                                // indirect overwrites direct's stats; keep last_update and created_at
-                                p.player.created_at = players.get(p.player.api_id).created_at;
+                                // indirect overwrites direct's stats; keep last_update and lmcd
                                 p.player.last_update = players.get(p.player.api_id).last_update;
+                                p.player.last_match_created_date = players.get(p.player.api_id).last_match_created_date;
                             }
                             // else direct/indirect overwrites indirect
                             players.set(p.player.api_id, p.player);
@@ -426,11 +427,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             match.assets.forEach((a) => asset_records.add(a));
         });
 
-        // player.last_update = last time bridge ran an update
-        // player.created_at = last match's created_at
-        //      that has been added to the database after fetching full history
-        // Here, all attributes *except* these two will be overwritten
-        //      if they are more recent in match.included data
+        // player.last_update = last time bridge ran an update (!= undefined for /players objects)
+        // player.last_match_created_date = last match from a full history fetch (as above)
+        // player.created_at = recency of the player object (on every object, always >= lmcd)
+        // last_update and lmcd must not be overwritten
         await Promise.map(players.values(), async (player) => {
             const count = await model.Player.count({ where: {
                 api_id: player.api_id,
@@ -480,12 +480,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 model.Player.bulkCreate(p_r, {
                     fields: [
                         // specify fields or Sequelize attempts to update all fields
+                        "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
                         "level", "lifetime_gold", "xp"
                     ],
                     updateOnDuplicate: [
-                        // only stats
+                        "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
                         "level", "lifetime_gold", "xp"
@@ -496,13 +497,15 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             await Promise.map(chunks(player_records_dates), async (p_r_d) =>
                 model.Player.bulkCreate(p_r_d, {
                     fields: [
-                        "last_update", "created_at",
+                        "last_update", "last_match_created_date",
+                        "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
                         "level", "lifetime_gold", "xp"
                     ],
                     updateOnDuplicate: [
-                        "last_update", "created_at",
+                        "last_update", "last_match_created_date",
+                        "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
                         "level", "lifetime_gold", "xp"
