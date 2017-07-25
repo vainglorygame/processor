@@ -221,6 +221,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             players: player_data.size,
             matches: match_data.size
         });
+        if (msgs.size == 0) {
+            logger.info("nothing to do");
+            return;
+        }
 
         // clean up to allow processor to accept while we wait for db
         clearTimeout(idle_timer);
