@@ -26,8 +26,6 @@ const RABBITMQ_URI = process.env.RABBITMQ_URI,
     MAXCONNS = parseInt(process.env.MAXCONNS) || 10,  // how many concurrent actions
     DOANALYZEMATCH = process.env.DOANALYZEMATCH == "true",
     ANALYZE_QUEUE = process.env.ANALYZE_QUEUE || "analyze",
-    DOCRUNCHMATCH = process.env.DOCRUNCHMATCH == "true",
-    CRUNCH_PLAYER_QUEUE = process.env.CRUNCH_PLAYER_QUEUE || "crunch_player",
     LOAD_TIMEOUT = parseFloat(process.env.LOAD_TIMEOUT) || 5000, // ms
     IDLE_TIMEOUT = parseFloat(process.env.IDLE_TIMEOUT) || 700;  // ms
 
@@ -277,11 +275,6 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 await Promise.each(match_objects, async (m) =>
                     await ch.sendToQueue(ANALYZE_QUEUE, new Buffer(m.id),
                         { persistent: true }));
-            if (DOCRUNCHMATCH) {
-                await Promise.each(match_objects, async (m) =>
-                    await ch.sendToQueue(CRUNCH_PLAYER_QUEUE, new Buffer(m.id),
-                        { persistent: true }));
-            }
         } catch (err) {
             if (err instanceof Seq.TimeoutError) {
                 // deadlocks / timeout
