@@ -186,6 +186,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     await ch.nack(msg, false, false);
                     await ch.sendToQueue(QUEUE + "_failed", msg.content, {
                         persistent: true,
+                        type: msg.properties.type,
                         headers: msg.properties.headers
                     });
                 } else {
