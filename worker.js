@@ -168,6 +168,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 const match = JSON.parse(msg.content);
                 // deduplicate and reject immediately
                 if (await model.Match.count({ where: { api_id: match.id } }) > 0) {
+                    logger.info("duplicate match", match.id);
                     if (msg.properties.headers.notify) {
                         await ch.publish("amq.topic",
                             msg.properties.headers.notify,
@@ -179,6 +180,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     }
                     await ch.nack(msg, false, false);
                 } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
+                    logger.info("invalid match", match.id);
                     // it is really `"null"`.
                     // reject invalid matches (handling API bugs)
                     await ch.nack(msg, false, false);
