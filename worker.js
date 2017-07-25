@@ -221,10 +221,6 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             players: player_data.size,
             matches: match_data.size
         });
-        if (msgs.size == 0) {
-            logger.info("nothing to do");
-            return;
-        }
 
         // clean up to allow processor to accept while we wait for db
         clearTimeout(idle_timer);
@@ -232,6 +228,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         idle_timer = undefined;
         load_timer = undefined;
 
+        if (msgs.size == 0) {
+            logger.info("nothing to do");
+            return;
+        }
         const player_objects = new Set(player_data),
             match_objects = new Set(match_data);
         player_data.clear();
