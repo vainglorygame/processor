@@ -289,6 +289,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 await Promise.map(msgs, async (m) => {
                     await ch.sendToQueue(QUEUE + "_failed", m.content, {
                         persistent: true,
+                        type: msg.properties.type,
                         headers: m.properties.headers
                     });
                     await ch.nack(m, false, false);
