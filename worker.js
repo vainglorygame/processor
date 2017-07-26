@@ -284,7 +284,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         { persistent: true }));
         } catch (err) {
             if (err instanceof Seq.TimeoutError ||
-                (err instanceof Seq.DatabaseError && err.code == 1213)) {
+                (err instanceof Seq.DatabaseError && err.errno == 1213)) {
                 // deadlocks / timeout
                 logger.error("SQL error", err);
                 await Promise.map(msgs, async (m) =>
