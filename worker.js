@@ -225,6 +225,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         profiler = undefined;
 
         logger.info("processing batch", {
+            messages: msgs.size,
             players: player_data.size,
             matches: match_data.size
         });
@@ -282,7 +283,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     await ch.sendToQueue(ANALYZE_QUEUE, new Buffer(m.id),
                         { persistent: true }));
         } catch (err) {
-            if (err instanceof Seq.TimeoutError) {
+            if (err instanceof Seq.TimeoutError ||
+                (err instanceof Seq.DatabaseError && err.code == 1213)) {
                 // deadlocks / timeout
                 logger.error("SQL error", err);
                 await Promise.map(msgs, async (m) =>
@@ -293,7 +295,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 await Promise.map(msgs, async (m) => {
                     await ch.sendToQueue(QUEUE + "_failed", m.content, {
                         persistent: true,
-                        type: msg.properties.type,
+                        type: m.properties.type,
                         headers: m.properties.headers
                     });
                     await ch.nack(m, false, false);
