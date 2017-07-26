@@ -172,11 +172,15 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     if (msg.properties.headers.notify) {
                         await ch.publish("amq.topic",
                             msg.properties.headers.notify,
-                            new Buffer("matches_dupe"))
+                            new Buffer("matches_dupe"));
                         // send match_dupe to web player.ign.api_id
                         await ch.publish("amq.topic",
                             msg.properties.headers.notify + "." + match.id,
-                            new Buffer("match_dupe"))
+                            new Buffer("match_dupe"));
+                        // HOTFIX TODO remove me, web should listen to match_dupe
+                        await ch.publish("amq.topic",
+                            msg.properties.headers.notify,
+                            new Buffer("match_update"));
                     }
                     await ch.nack(msg, false, false);
                 } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
