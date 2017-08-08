@@ -97,7 +97,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
     // connect to rabbit & db
     const seq = new Seq(DATABASE_URI, {
         logging: false,
-        max: MAXCONNS
+        pool: {
+            max: MAXCONNS
+        }
     });
 
     const ch = await rabbit.createChannel();
