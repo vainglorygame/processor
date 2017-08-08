@@ -105,11 +105,17 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
     const ch = await rabbit.createChannel();
     await ch.assertQueue(QUEUE, { durable: true });
     await ch.assertQueue(QUEUE + "_failed", { durable: true });
+    await ch.assertQueue(ANALYZE_QUEUE, { durable: true });
     // as long as the queue is filled, msg are not ACKed
     // server sends as long as there are less than `prefetch` unACKed
     await ch.prefetch(BATCHSIZE);
 
     const model = require("../orm/model")(seq, Seq);
+
+    logger.info("configuration", {
+        QUEUE, BATCHSIZE, CHUNKSIZE, MAXCONNS, LOAD_TIMEOUT, IDLE_TIMEOUT,
+        DOANALYZEMATCH, ANALYZE_QUEUE
+    });
 
     // performance logging
     let load_timer = undefined,
