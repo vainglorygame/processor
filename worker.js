@@ -20,7 +20,7 @@ const RABBITMQ_URI = process.env.RABBITMQ_URI,
     QUEUE = process.env.QUEUE || "process",
     LOGGLY_TOKEN = process.env.LOGGLY_TOKEN,
     // matches + players, 5 players with 50 matches as default
-    BATCHSIZE = parseInt(process.env.BATCHSIZE) || 5 * (50 + 1),
+    BATCHSIZE = 1, // parseInt(process.env.BATCHSIZE) || 5 * (50 + 1),
     // maximum number of elements to be inserted in one statement
     CHUNKSIZE = parseInt(process.env.CHUNKSIZE) || 100,
     MAXCONNS = parseInt(process.env.MAXCONNS) || 10,  // how many concurrent actions
@@ -190,12 +190,12 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                             msg.properties.headers.notify,
                             new Buffer("match_update"));
                     }
-                    await ch.nack(msg, false, false);
+                    //await ch.nack(msg, false, false);
                 } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
                     logger.info("invalid match", match.id);
                     // it is really `"null"`.
                     // reject invalid matches (handling API bugs)
-                    await ch.nack(msg, false, false);
+                    //await ch.nack(msg, false, false);
                     await ch.sendToQueue(QUEUE + "_failed", msg.content, {
                         persistent: true,
                         type: msg.properties.type,
@@ -294,8 +294,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 (err instanceof Seq.DatabaseError && err.errno == 1213)) {
                 // deadlocks / timeout
                 logger.error("SQL error", err);
-                await Promise.map(msgs, async (m) =>
-                    await ch.nack(m, false, true));  // retry
+                //await Promise.map(msgs, async (m) =>
+                    //await ch.nack(m, false, true));  // retry
             } else {
                 // log, move to error queue and NACK
                 logger.error(err);
@@ -305,7 +305,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         type: m.properties.type,
                         headers: m.properties.headers
                     });
-                    await ch.nack(m, false, false);
+                    //await ch.nack(m, false, false);
                 });
             }
         }
@@ -380,19 +380,28 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     let itms = [];
 
                     const pas = participant.attributes.stats;  // I'm lazy
-                    // csv
-                    participant.attributes.stats.items =
-                        pas.items.map((i) => item_id(i).toString()).join(",");
-                    // csv with count seperated by ;
-                    participant.attributes.stats.itemGrants =
-                        Object.keys(pas.itemGrants)
-                            .map((key) => item_id(key) + ";" + pas.itemGrants[key]).join(",");
-                    participant.attributes.stats.itemUses =
-                        Object.keys(pas.itemUses)
-                            .map((key) => item_id(key) + ";" + pas.itemUses[key]).join(",");
-                    participant.attributes.stats.itemSells =
-                        Object.keys(pas.itemSells)
-                            .map((key) => item_id(key) + ";" + pas.itemSells[key]).join(",");
+
+                    // Map { idx: item id }
+                    const items = new Map();
+                    pas.items.forEach((i, idx) =>
+                        items.set(idx, item_id(i)));
+                    pas.items = items;
+
+                    // Map { item id: count }
+                    const itemGrants = new Map();
+                    Object.entries(pas.itemGrants).forEach(([i, cnt]) =>
+                        itemGrants.set(item_id(i), cnt));
+                    pas.itemGrants = itemGrants;
+
+                    const itemUses = new Map();
+                    Object.entries(pas.itemUses).forEach(([i, cnt]) =>
+                        itemUses.set(item_id(i), cnt));
+                    pas.itemUses = itemUses;
+
+                    const itemSells = new Map();
+                    Object.entries(pas.itemSells).forEach(([i, cnt]) =>
+                        itemSells.set(item_id(i), cnt));
+                    pas.itemSells = itemSells;
 
                     participant.player.attributes.shardId = participant.player.attributes.shardId
                         || participant.attributes.shardId;
@@ -417,10 +426,32 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             match.rosters.forEach((r) => {
                 roster_records.add(r);
                 r.participants.forEach((p) => {
-                    const p_pstats = calculate_participant_stats(match, r, p);
+                    const p_pstats = calculate_participant_stats(match, r, p),
+                        part = p_pstats[0],
+                        pstats = p_pstats[1];
+                    if (pstats.items.size > 0)
+                        pstats.items = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pstats.items.entries()));
+                    else pstats.items = "";
+
+                    if (pstats.item_grants.size > 0)
+                        pstats.item_grants = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pstats.item_grants.entries()));
+                    else pstats.item_grants = "";
+
+                    if (pstats.item_uses.size > 0)
+                        pstats.item_uses = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pstats.item_uses.entries()));
+                    else pstats.item_uses = "";
+
+                    if (pstats.item_sells.size > 0)
+                        pstats.item_sells = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pstats.item_sells.entries()));
+                    else pstats.item_sells = "";
+
                     // participant gets split into participant and p_stats
-                    participant_records.add(p_pstats[0]);
-                    participant_stats_records.add(p_pstats[1]);
+                    participant_records.add(part);
+                    participant_stats_records.add(pstats);
 
                     // if match.included has an unknown player
                     if (!players.has(p.player.api_id))
