@@ -262,11 +262,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             // notify web
             await Promise.map(msgs, async (m) => {
                 if (m.properties.headers.notify == undefined) return;
-                let notif = "";
                 switch (m.properties.type) {
                     // new match
                     case "match":
-                        notif = "matches_update";
                         // notify player.name.api_id about match_update
                         await Promise.map(match_objects, async (mat) =>
                             await ch.publish("amq.topic",
@@ -278,7 +276,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         break;
                     case "player":
                         // player obj updated
-                        notif = "stats_update";
+                        await ch.publish("amq.topic", m.properties.headers.notify,
+                            new Buffer("stats_update"));
                         break;
                 }
             });
