@@ -20,7 +20,7 @@ const RABBITMQ_URI = process.env.RABBITMQ_URI,
     QUEUE = process.env.QUEUE || "process",
     LOGGLY_TOKEN = process.env.LOGGLY_TOKEN,
     // matches + players, 5 players with 50 matches as default
-    BATCHSIZE = 1, // parseInt(process.env.BATCHSIZE) || 5 * (50 + 1),
+    BATCHSIZE = parseInt(process.env.BATCHSIZE) || 5 * (50 + 1),
     // maximum number of elements to be inserted in one statement
     CHUNKSIZE = parseInt(process.env.CHUNKSIZE) || 100,
     MAXCONNS = parseInt(process.env.MAXCONNS) || 10,  // how many concurrent actions
@@ -190,12 +190,12 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                             msg.properties.headers.notify,
                             new Buffer("match_update"));
                     }
-                    //await ch.nack(msg, false, false);
+                    await ch.nack(msg, false, false);
                 } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
                     logger.info("invalid match", match.id);
                     // it is really `"null"`.
                     // reject invalid matches (handling API bugs)
-                    //await ch.nack(msg, false, false);
+                    await ch.nack(msg, false, false);
                     await ch.sendToQueue(QUEUE + "_failed", msg.content, {
                         persistent: true,
                         type: msg.properties.type,
@@ -294,8 +294,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 (err instanceof Seq.DatabaseError && err.errno == 1213)) {
                 // deadlocks / timeout
                 logger.error("SQL error", err);
-                //await Promise.map(msgs, async (m) =>
-                    //await ch.nack(m, false, true));  // retry
+                await Promise.map(msgs, async (m) =>
+                    await ch.nack(m, false, true));  // retry
             } else {
                 // log, move to error queue and NACK
                 logger.error(err);
@@ -305,7 +305,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         type: m.properties.type,
                         headers: m.properties.headers
                     });
-                    //await ch.nack(m, false, false);
+                    await ch.nack(m, false, false);
                 });
             }
         }
