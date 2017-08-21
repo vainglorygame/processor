@@ -157,23 +157,23 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
     // buffers that will be filled until BATCHSIZE is reached
     // to make db transactions more efficient
     let player_data = new Set(),
-        match_data = new Set(),
-        msg_buffer = new Set();
+        match_data = new Set();
 
     ch.consume(QUEUE, async (msg) => {
         switch (msg.properties.type) {
             case "player":
                 // bridge sends a single object
                 let player = JSON.parse(msg.content);
+                msg.content = player;
                 // player objects that arrive here came from a search
                 // with search, bridge can't update last_update
                 player.last_update = seq.fn("NOW");
-                player_data.add(player);
-                msg_buffer.add(msg);
+                player_data.add(msg);
                 break;
             case "match":
                 // apigrabber sends a single object
                 const match = JSON.parse(msg.content);
+                msg.content = match;
                 // deduplicate and reject immediately
                 if (await model.Match.count({ where: { api_id: match.id } }) > 0) {
                     logger.info("duplicate match", match.id);
@@ -202,8 +202,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     });
                 } else {
                     // all good
-                    match_data.add(match);
-                    msg_buffer.add(msg);
+                    match_data.add(msg);
                 }
                 break;
         }
@@ -225,14 +224,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
     // wrap process() in message handler
     async function tryProcess() {
-        const msgs = new Set(msg_buffer);
-        msg_buffer.clear();
-
         profiler.done("buffer filled");
         profiler = undefined;
 
         logger.info("processing batch", {
-            messages: msgs.size,
             players: player_data.size,
             matches: match_data.size
         });
@@ -243,7 +238,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         idle_timer = undefined;
         load_timer = undefined;
 
-        if (msgs.size == 0) {
+        if (player_data.size + match_data.size == 0) {
             logger.info("nothing to do");
             return;
         }
@@ -255,44 +250,54 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         try {
             await process(player_objects, match_objects);
 
-            logger.info("acking batch", { size: msgs.size });
-            await Promise.map(msgs, async (m) => await ch.ack(m));
+            logger.info("acking batch", {
+                size: player_objects.size + match_objects.size
+            });
+            await Promise.map(player_objects, async (m) => await ch.ack(m));
+            await Promise.map(match_objects, async (m) => await ch.ack(m));
 
             // notify web
-            await Promise.map(msgs, async (m) => {
+            await Promise.map(match_objects, async (m) => {
                 if (m.properties.headers.notify == undefined) return;
-                switch (m.properties.type) {
-                    // new match
-                    case "match":
-                        await ch.publish("amq.topic", m.properties.headers.notify,
-                            new Buffer("match_update"));
-                        break;
-                    case "player":
-                        // player obj updated
-                        await ch.publish("amq.topic", m.properties.headers.notify,
-                            new Buffer("stats_update"));
-                        break;
-                }
+                await ch.publish("amq.topic", m.properties.headers.notify,
+                    new Buffer("match_update"));
+            });
+            await Promise.map(player_objects, async (m) => {
+                if (m.properties.headers.notify == undefined) return;
+                await ch.publish("amq.topic", m.properties.headers.notify,
+                    new Buffer("player_update"));
             });
             // …global about new matches
             if (match_objects.length > 0)
                 await ch.publish("amq.topic", "global", new Buffer("matches_update"));
             // notify follow up services
-            if (DOANALYZEMATCH)
-                await Promise.each(match_objects, async (m) =>
-                    await ch.sendToQueue(ANALYZE_QUEUE, new Buffer(m.id),
-                        { persistent: true }));
+            if (DOANALYZEMATCH)  // TODO
+                await Promise.each(match_objects, async (msg) => {
+                    await ch.sendToQueue(ANALYZE_QUEUE,
+                        new Buffer(msg.content.id),
+                        { persistent: true });
+                });
         } catch (err) {
             if (err instanceof Seq.TimeoutError ||
                 (err instanceof Seq.DatabaseError && err.errno == 1213)) {
                 // deadlocks / timeout
                 logger.error("SQL error", err);
-                await Promise.map(msgs, async (m) =>
+                await Promise.map(player_objects, async (m) =>
                     await ch.nack(m, false, true));  // retry
+                await Promise.map(match_objects, async (m) =>
+                    await ch.nack(m, false, true));
             } else {
                 // log, move to error queue and NACK
                 logger.error(err);
-                await Promise.map(msgs, async (m) => {
+                await Promise.map(player_objects, async (m) => {
+                    await ch.sendToQueue(QUEUE + "_failed", m.content, {
+                        persistent: true,
+                        type: m.properties.type,
+                        headers: m.properties.headers
+                    });
+                    await ch.nack(m, false, false);
+                });
+                await Promise.map(match_objects, async (m) => {
                     await ch.sendToQueue(QUEUE + "_failed", m.content, {
                         persistent: true,
                         type: m.properties.type,
@@ -319,8 +324,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
         // populate `_records`
         // data from `/players`
-        player_objects.forEach((p) => {
-            let player = flatten(p);
+        player_objects.forEach((msg) => {
+            let player = flatten(msg.content);
             player.created_at = new Date(Date.parse(player.created_at));
             player.last_match_created_date = player.created_at;
 
@@ -337,7 +342,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         });
 
         // data from `/matches`
-        match_objects.forEach((match) => {
+        match_objects.forEach((msg) => {
+            let match = msg.content;
             match.createdAt = new Date(Date.parse(match.createdAt));
 
             // flatten jsonapi nested response into our db structure-like shape
