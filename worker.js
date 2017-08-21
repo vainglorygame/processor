@@ -318,6 +318,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             roster_records = new Set(),
             participant_records = new Set(),
             participant_stats_records = new Set(),
+            participant_items_records = new Set(),
             players = new Map(),
             player_records = new Set(),
             player_records_dates = new Set(),  // from /players
@@ -381,27 +382,47 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
                     const pas = participant.attributes.stats;  // I'm lazy
 
-                    // Map { idx: item id }
-                    const items = new Map();
-                    pas.items.forEach((i, idx) =>
-                        items.set(idx, item_id(i)));
-                    pas.items = items;
+                    participant.participantItems = {};
+                    let ppi = participant.participantItems;
 
+                    // Map for dynamic columns, participant_items table
                     // Map { item id: count }
+                    const items = new Map();
+                    pas.items.forEach((i, idx) => {
+                        // if this is the first occurence of the item…
+                        if (pas.items.findIndex((_i) => _i == i) == idx)
+                            // …set id ->…
+                            items.set(item_id(i),
+                                // …count(*).
+                                pas.items.filter((_i) => _i == i).length
+                            )
+                    });
+                    ppi.items = items;
+
                     const itemGrants = new Map();
                     Object.entries(pas.itemGrants).forEach(([i, cnt]) =>
                         itemGrants.set(item_id(i), cnt));
-                    pas.itemGrants = itemGrants;
+                    ppi.item_grants = itemGrants;
 
                     const itemUses = new Map();
                     Object.entries(pas.itemUses).forEach(([i, cnt]) =>
                         itemUses.set(item_id(i), cnt));
-                    pas.itemUses = itemUses;
+                    ppi.item_uses = itemUses;
 
                     const itemSells = new Map();
                     Object.entries(pas.itemSells).forEach(([i, cnt]) =>
                         itemSells.set(item_id(i), cnt));
-                    pas.itemSells = itemSells;
+                    ppi.item_sells = itemSells;
+
+                    // csv for backwards compatibility (TODO)
+                    pas.items = pas.items.map((i) => item_id(i).toString()).join(",");
+                    // csv with count seperated by ;
+                    pas.itemGrants = Object.keys(pas.itemGrants)
+                        .map((key) => item_id(key) + ";" + pas.itemGrants[key]).join(",");
+                    pas.itemUses = Object.keys(pas.itemUses)
+                        .map((key) => item_id(key) + ";" + pas.itemUses[key]).join(",");
+                    pas.itemSells = Object.keys(pas.itemSells)
+                        .map((key) => item_id(key) + ";" + pas.itemSells[key]).join(",");
 
                     participant.player.attributes.shardId = participant.player.attributes.shardId
                         || participant.attributes.shardId;
@@ -409,6 +430,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         participant.player.attributes.createdAt =
                             new Date(Date.parse(participant.player.attributes.createdAt));
                     else participant.player.attributes.created_at = participant.createdAt;
+
+                    // `flatten` will only flatten what is in `.attributes` & meta data
+                    ppi = flatten(ppi);
                     participant.player = flatten(participant.player);
                     return flatten(participant);
                 });
@@ -426,32 +450,35 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             match.rosters.forEach((r) => {
                 roster_records.add(r);
                 r.participants.forEach((p) => {
+                    // splits participant into `participant`, `participant_stats` and `participant_items`
                     const p_pstats = calculate_participant_stats(match, r, p),
                         part = p_pstats[0],
-                        pstats = p_pstats[1];
-                    if (pstats.items.size > 0)
-                        pstats.items = Seq.fn("COLUMN_CREATE",
-                            [].concat(...pstats.items.entries()));
-                    else pstats.items = "";
+                        pstats = p_pstats[1],
+                        pitems = p_pstats[2];
+                    if (pitems.items.size > 0)
+                        pitems.items = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pitems.items.entries()));
+                    else pitems.items = "";
 
-                    if (pstats.item_grants.size > 0)
-                        pstats.item_grants = Seq.fn("COLUMN_CREATE",
-                            [].concat(...pstats.item_grants.entries()));
-                    else pstats.item_grants = "";
+                    if (pitems.item_grants.size > 0)
+                        pitems.item_grants = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pitems.item_grants.entries()));
+                    else pitems.item_grants = "";
 
-                    if (pstats.item_uses.size > 0)
-                        pstats.item_uses = Seq.fn("COLUMN_CREATE",
-                            [].concat(...pstats.item_uses.entries()));
-                    else pstats.item_uses = "";
+                    if (pitems.item_uses.size > 0)
+                        pitems.item_uses = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pitems.item_uses.entries()));
+                    else pitems.item_uses = "";
 
-                    if (pstats.item_sells.size > 0)
-                        pstats.item_sells = Seq.fn("COLUMN_CREATE",
-                            [].concat(...pstats.item_sells.entries()));
-                    else pstats.item_sells = "";
+                    if (pitems.item_sells.size > 0)
+                        pitems.item_sells = Seq.fn("COLUMN_CREATE",
+                            [].concat(...pitems.item_sells.entries()));
+                    else pitems.item_sells = "";
 
-                    // participant gets split into participant and p_stats
+                    // push split records
                     participant_records.add(part);
                     participant_stats_records.add(pstats);
+                    participant_items_records.add(pitems);
 
                     // if match.included has an unknown player
                     if (!players.has(p.player.api_id))
@@ -523,6 +550,12 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     transaction: transaction
                 }), { concurrency: MAXCONNS }
             );
+            await Promise.map(chunks(participant_items_records), async (p_i_r) =>
+                model.ParticipantItems.bulkCreate(p_i_r, {
+                    ignoreDuplicates: true,
+                    transaction: transaction
+                }), { concurrency: MAXCONNS }
+            );
             await Promise.map(chunks(player_records), async (p_r) =>
                 model.Player.bulkCreate(p_r, {
                     fields: [
@@ -574,9 +607,16 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
     // Should not need to query db here.
     function calculate_participant_stats(match, roster, participant) {
         let p_s = {},  // participant_stats_record
+            p_i = {},  // participant_items record (dynamic columns, csv is on p_s [TODO])
             p = {};  // participant_record
 
-        // copy all values that are required in db `participant` to `p`/`p_s` here
+        // copy all values that are required in db `participant` to `p`/`p_s`/`p_i` here
+        // items - simple, has been prepared in `process()` already (grep for `ppi`)
+        p_i = participant.participant_items;
+        // not really "item", but I need this one
+        p_i.surrendered = (match.end_game_reason == "surrender" && participant.winner == false);
+        p_i.participant_api_id = participant.api_id;
+
         // meta
         p_s.participant_api_id = participant.api_id;
         p_s.final = true;  // these are the stats at the end of the match
@@ -588,6 +628,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         p_s.item_uses = participant.item_uses;
         p_s.item_sells = participant.item_sells;
         p_s.duration = match.duration;
+
         p.created_at = match.created_at;
         // mappings
         // hero names additionally need to be mapped old to new names
@@ -650,7 +691,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         if (roster.hero_kills == 0) p_s.kill_participation = 0;
         else p_s.kill_participation = (p_s.kills + p_s.assists) / roster.hero_kills;
 
-        return [p, p_s];
+        return [p, p_s, p_i];
     }
 
     // return "captain" "carry" "jungler"
