@@ -264,12 +264,6 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 switch (m.properties.type) {
                     // new match
                     case "match":
-                        // notify player.name.api_id about match_update
-                        await Promise.map(match_objects, async (mat) =>
-                            await ch.publish("amq.topic",
-                                m.properties.headers.notify + "." + mat.id,
-                                new Buffer("match_update"))
-                        );
                         await ch.publish("amq.topic", m.properties.headers.notify,
                             new Buffer("match_update"));
                         break;
