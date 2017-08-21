@@ -185,14 +185,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         await ch.publish("amq.topic",
                             msg.properties.headers.notify + "." + match.id,
                             new Buffer("match_dupe"));
-                        // HOTFIX TODO remove me, web should listen to match_dupe
-                        await ch.publish("amq.topic",
-                            msg.properties.headers.notify,
-                            new Buffer("match_update"));
                     }
                     await ch.nack(msg, false, false);
                 } else if (match.rosters.length < 2 || match.rosters[0].id == "null")  {
                     logger.info("invalid match", match.id);
+                    await ch.publish("amq.topic",
+                        msg.properties.headers.notify + "." + match.id,
+                        new Buffer("match_invalid"));
                     // it is really `"null"`.
                     // reject invalid matches (handling API bugs)
                     await ch.nack(msg, false, false);
