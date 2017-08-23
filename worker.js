@@ -271,12 +271,17 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             if (match_objects.length > 0)
                 await ch.publish("amq.topic", "global", new Buffer("matches_update"));
             // notify follow up services
-            if (DOANALYZEMATCH)  // TODO
+            if (DOANALYZEMATCH) {
                 await Promise.each(match_objects, async (msg) => {
+                    await ch.publish("amq.topic", m.properties.headers.notify,
+                        new Buffer("analyze_pending"));
                     await ch.sendToQueue(ANALYZE_QUEUE,
-                        new Buffer(msg.content.id),
-                        { persistent: true });
+                        new Buffer(msg.content.id), {
+                            persistent: true,
+                            headers: { notify: msg.properties.headers.notify }
+                        });
                 });
+            }
         } catch (err) {
             if (err instanceof Seq.TimeoutError ||
                 (err instanceof Seq.DatabaseError && err.errno == 1213)) {
