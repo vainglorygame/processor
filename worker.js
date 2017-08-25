@@ -672,7 +672,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             "gold", "farm"].map((attr) =>
                 p_s[attr] = participant[attr]);
 
-        let role = classify_role(p_s);
+        let role = classify_role(p_s, p);
 
         // score calculations
         let impact_score = 50;
@@ -704,7 +704,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
     }
 
     // return "captain" "carry" "jungler"
-    function classify_role(participant_stats) {
+    function classify_role(participant_stats, participant) {
+        // override Brawl, proper roles aren't defined yet
+        if (participant.game_mode_id == game_mode_db_map.get("blitz_pvp_ranked") ||
+            participant.game_mode_id == game_mode_db_map.get("casual_aral")) {
+            return "all";
+        }
+
         const is_captain_score = 2.34365487 + (-0.06188674 * participant_stats.non_jungle_minion_kills) + (-0.10575069 * participant_stats.jungle_kills),  // about 88% accurate, trained on Hero.is_captain
             is_carry_score = -1.88524473 + (0.05593593 * participant_stats.non_jungle_minion_kills) + (-0.0881661 * participant_stats.jungle_kills),  // about 90% accurate, trained on Hero.is_carry
             is_jungle_score = -0.78327066 + (-0.03324596 * participant_stats.non_jungle_minion_kills) + (0.10514832 * participant_stats.jungle_kills);  // about 88% accurate
