@@ -333,7 +333,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         // populate `_records`
         // data from `/players`
         player_objects.forEach((msg) => {
-            let player = flatten(msg.content);
+            // flatten a deep clone, the original object is needed
+            // so it can be moved into the failed queue
+            let player = flatten(JSON.parse(JSON.stringify(msg.content)));
             player.created_at = new Date(Date.parse(player.created_at));
             player.last_match_created_date = player.created_at;
 
@@ -351,7 +353,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
 
         // data from `/matches`
         match_objects.forEach((msg) => {
-            let match = msg.content;
+            let match = JSON.parse(JSON.stringify(msg.content));  // deep clone
             match.createdAt = new Date(Date.parse(match.createdAt));
 
             // flatten jsonapi nested response into our db structure-like shape
