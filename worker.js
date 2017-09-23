@@ -376,7 +376,14 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     participant.attributes.stats.jungleKills = participant.attributes.stats.jungleKills || 0;
 
                     // map items: names/id -> name -> db
-                    const item_id = ((i) => item_db_map.get(api_name_mappings.get(i)));
+                    const item_id = ((i) => {
+                        try {
+                            return item_db_map.get(api_name_mappings.get(i));
+                        } catch (err) {
+                            logger.error("mapping error", i);
+                            throw err;
+                        }
+                    });
                     let itms = [];
 
                     const pas = participant.attributes.stats;  // I'm lazy
