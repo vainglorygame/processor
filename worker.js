@@ -424,7 +424,12 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     ppi.item_sells = itemSells;
 
                     // csv for backwards compatibility (TODO)
-                    pas.items = pas.items.map((i) => item_id(i).toString()).join(",");
+                    try {
+                        pas.items = pas.items.map((i) => item_id(i).toString()).join(",");
+                    } catch (err) {
+                        logger.error(pas.items);
+                        throw err;
+                    }
                     // csv with count seperated by ;
                     pas.itemGrants = Object.keys(pas.itemGrants)
                         .map((key) => item_id(key) + ";" + pas.itemGrants[key]).join(",");
