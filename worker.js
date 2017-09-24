@@ -207,6 +207,9 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     msg_buffer.add(msg);
                 }
                 break;
+            default:
+                logger.error("invalid message", msg);
+                await ch.nack(msg, false, false);
         }
 
         // fill queue until batchsize or idle
