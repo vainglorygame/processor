@@ -244,14 +244,15 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         idle_timer = undefined;
         load_timer = undefined;
 
-        if (msgs.size == 0) {
-            logger.info("nothing to do");
-            return;
-        }
         const player_objects = new Set(player_data),
             match_objects = new Set(match_data);
         player_data.clear();
         match_data.clear();
+
+        if (msgs.size == 0) {
+            logger.info("nothing to do");
+            return;
+        }
 
         try {
             await process(player_objects, match_objects);
