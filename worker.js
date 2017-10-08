@@ -165,9 +165,6 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 // bridge sends a single object
                 let player = JSON.parse(msg.content);
                 msg.content = player;
-                // player objects that arrive here came from a search
-                // with search, bridge can't update last_update
-                player.last_update = seq.fn("NOW");
                 player_data.add(msg);
                 break;
             case "match":
@@ -338,6 +335,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             let player = flatten(JSON.parse(JSON.stringify(msg.content)));
             player.created_at = new Date(Date.parse(player.created_at));
             player.last_match_created_date = player.created_at;
+            player.last_update = seq.fn("NOW");  // TODO set msg.timestamp in bridge and parse here
 
             logger.info("processing player",
                 { name: player.name, region: player.shard_id });
