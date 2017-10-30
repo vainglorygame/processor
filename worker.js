@@ -10,6 +10,7 @@
 
 const amqp = require("amqplib"),
     Promise = require("bluebird"),
+    uuidV4 = require("uuid/v4"),
     winston = require("winston"),
     loggly = require("winston-loggly-bulk"),
     Seq = require("sequelize"),
@@ -86,6 +87,19 @@ function flatten(obj) {
     delete o.stats;
     delete o.relationships;
     return snakeCaseKeys(o);
+}
+
+// check for a valid UUID v4 or generate one
+const uuidV4Regex = /^[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}$/i;
+function uuidfy(id) {
+    if (uuidV4Regex.test(id)) {
+        return id;
+    }
+
+    const uuid = uuidV4();
+    logger.error("found invalid UUID, generated a new one", { id, uuid });
+    console.trace();
+    return uuid;
 }
 
 amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
@@ -333,6 +347,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             // flatten a deep clone, the original object is needed
             // so it can be moved into the failed queue
             let player = flatten(JSON.parse(JSON.stringify(msg.content)));
+            player.api_id = uuidfy(player.api_id);
             player.created_at = new Date(Date.parse(player.created_at));
             player.last_match_created_date = player.created_at;
             player.last_update = seq.fn("NOW");  // TODO set msg.timestamp in bridge and parse here
@@ -352,11 +367,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         // data from `/matches`
         match_objects.forEach((msg) => {
             let match = JSON.parse(JSON.stringify(msg.content));  // deep clone
+            match.id = uuidfy(match.id);
             match.createdAt = new Date(Date.parse(match.createdAt));
 
             // flatten jsonapi nested response into our db structure-like shape
             // also, push missing fields
             match.rosters = match.rosters.map((roster) => {
+                roster.id = uuidfy(roster.id);
                 roster.matchApiId = match.id;
                 // TODO backwards compatibility, all objects have shardId since May 10th
                 roster.attributes.shardId = roster.attributes.shardId || match.attributes.shardId;
@@ -368,6 +385,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     roster.attributes.stats.winner = false;
 
                 roster.participants = roster.participants.map((participant) => {
+                    participant.id = uuidfy(participant.id);
                     // ! attributes added here need to be added via `calculate_participant_stats` too
                     participant.attributes.shardId = participant.attributes.shardId || roster.attributes.shardId;
                     participant.rosterApiId = roster.id;
@@ -451,6 +469,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                 return flatten(roster);
             });
             match.assets = match.assets.map((asset) => {
+                asset.id = uuidfy(asset.id);
                 asset.matchApiId = match.id;
                 asset.attributes.shardId = asset.attributes.shardId || match.attributes.shardId;
                 return flatten(asset);
