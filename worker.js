@@ -13,6 +13,7 @@ const amqp = require("amqplib"),
     uuidV4 = require("uuid/v4"),
     winston = require("winston"),
     loggly = require("winston-loggly-bulk"),
+    _snakecase = require("lodash/snakeCase"),
     Seq = require("sequelize"),
     api_name_mappings = require("../orm/mappings").map;
 
@@ -48,17 +49,10 @@ if (LOGGLY_TOKEN)
         json: true
     });
 
-// helpers
-const camelCaseRegExp = new RegExp(/([a-z])([A-Z]+)/g);
-function camelToSnake(text) {
-    return text.replace(camelCaseRegExp, (m, $1, $2) =>
-        $1 + "_" + $2.toLowerCase());
-}
-
 // MadGlory API uses snakeCase, our db uses camel_case
 function snakeCaseKeys(obj) {
     Object.keys(obj).forEach((key) => {
-        const new_key = camelToSnake(key);
+        const new_key = _snakecase(key);
         if (new_key == key) return;
         obj[new_key] = obj[key];
         delete obj[key];
@@ -76,17 +70,27 @@ function* chunks(data) {
 // helper to convert API response into flat JSON
 // db structure is (almost) 1:1 the API structure
 // so we can insert the flat API response as-is
-function flatten(obj) {
-    const attrs = obj.attributes || {},
-        stats = attrs.stats || {};
-    let o = Object.assign({}, obj, attrs, stats);
+function flatten(o) {
     o.api_id = o.id;  // rename
     delete o.id;
+    if ("stats" in o) {
+        Object.assign(o, snakeCaseKeys(o.stats));  // merge stats
+        delete o.stats;
+    }
+    if ("rank_points" in o) {  // flatten player attributes introduced 12/14/17
+        o.rank_points_ranked = o.rank_points.ranked || 0;
+        o.rank_points_blitz = o.rank_points.blitz || 0;
+        delete o.rank_points;
+    }
+    if ("games" in o) {
+        o.played_ranked = o.games.ranked || 0;
+        o.played_casual = o.games.casual || 0;
+        o.played_blitz = o.games.blitz || 0;
+        o.played_aral = o.games.aral || 0;
+        delete o.games;
+    }
     delete o.type;
-    delete o.attributes;
-    delete o.stats;
-    delete o.relationships;
-    return snakeCaseKeys(o);
+    return o;
 }
 
 // check for a valid UUID v4 or generate one
@@ -348,7 +352,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             // so it can be moved into the failed queue
             let player = flatten(JSON.parse(JSON.stringify(msg.content)));
             player.api_id = uuidfy(player.api_id);
-            player.created_at = new Date(Date.parse(player.created_at));
+            player.created_at = new Date(Date.parse(player.last_updated || player.created_at));  // lastUpdated (notice the 'd') introduced 12/14/17
             player.last_match_created_date = player.created_at;
             player.last_update = seq.fn("NOW");  // TODO set msg.timestamp in bridge and parse here
 
@@ -368,47 +372,47 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         match_objects.forEach((msg) => {
             let match = JSON.parse(JSON.stringify(msg.content));  // deep clone
             match.id = uuidfy(match.id);
-            match.createdAt = new Date(Date.parse(match.createdAt));
+            match.created_at = new Date(Date.parse(match.created_at));
 
             // flatten jsonapi nested response into our db structure-like shape
             // also, push missing fields
             match.rosters = match.rosters.map((roster) => {
                 roster.id = uuidfy(roster.id);
-                roster.matchApiId = match.id;
+                roster.match_api_id = match.id;
                 // TODO backwards compatibility, all objects have shardId since May 10th
-                roster.attributes.shardId = roster.attributes.shardId || match.attributes.shardId;
-                roster.createdAt = match.createdAt;
+                roster.shard_id = roster.shard_id || match.shard_id;
+                roster.created_at = match.created_at;
                 // TODO API workaround: roster does not have `winner`
                 if (roster.participants.length > 0)
-                    roster.attributes.stats.winner = roster.participants[0].stats.winner;
+                    roster.stats.winner = roster.participants[0].stats.winner;
                 else  // Blitz 2v0, see 095e86e4-1bd3-11e7-b0b1-0297c91b7699 on eu
-                    roster.attributes.stats.winner = false;
+                    roster.stats.winner = false;
 
                 roster.participants = roster.participants.map((participant) => {
                     participant.id = uuidfy(participant.id);
                     // ! attributes added here need to be added via `calculate_participant_stats` too
-                    participant.attributes.shardId = participant.attributes.shardId || roster.attributes.shardId;
-                    participant.rosterApiId = roster.id;
-                    participant.matchApiId = match.id;
-                    participant.createdAt = roster.createdAt;
-                    participant.playerApiId = participant.player.id;
+                    participant.shard_id = participant.shard_id || roster.shard_id;
+                    participant.roster_api_id = roster.id;
+                    participant.match_api_id = match.id;
+                    participant.created_at = roster.created_at;
+                    participant.player_api_id = participant.player.id;
 
                     // API bug fixes (TODO)
                     // items on AFK is `null` not `{}`
-                    participant.attributes.stats.itemGrants = participant.attributes.stats.itemGrants || {};
-                    participant.attributes.stats.itemSells = participant.attributes.stats.itemSells || {};
-                    participant.attributes.stats.itemUses = participant.attributes.stats.itemUses || {};
+                    participant.stats.itemGrants = participant.stats.itemGrants || {};
+                    participant.stats.itemSells = participant.stats.itemSells || {};
+                    participant.stats.itemUses = participant.stats.itemUses || {};
                     // jungle_kills is `null` in BR
-                    participant.attributes.stats.jungleKills = participant.attributes.stats.jungleKills || 0;
+                    participant.stats.jungleKills = participant.stats.jungleKills || 0;
 
                     // map items: names/id -> name -> db
                     const item_id = ((i) => item_db_map.get(api_name_mappings.get(i)));
                     let itms = [];
 
-                    const pas = participant.attributes.stats;  // I'm lazy
+                    const pas = participant.stats;  // I'm lazy
 
-                    participant.participantItems = {};
-                    let ppi = participant.participantItems;
+                    participant.participant_items = {};
+                    let ppi = participant.participant_items;
 
                     // Map for dynamic columns, participant_items table
                     // Map { item id: count }
@@ -424,20 +428,20 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     });
                     ppi.items = items;
 
-                    const itemGrants = new Map();
+                    const item_grants = new Map();
                     Object.entries(pas.itemGrants).forEach(([i, cnt]) =>
-                        itemGrants.set(item_id(i), cnt));
-                    ppi.item_grants = itemGrants;
+                        item_grants.set(item_id(i), cnt));
+                    ppi.item_grants = item_grants;
 
-                    const itemUses = new Map();
+                    const item_uses = new Map();
                     Object.entries(pas.itemUses).forEach(([i, cnt]) =>
-                        itemUses.set(item_id(i), cnt));
-                    ppi.item_uses = itemUses;
+                        item_uses.set(item_id(i), cnt));
+                    ppi.item_uses = item_uses;
 
-                    const itemSells = new Map();
+                    const item_sells = new Map();
                     Object.entries(pas.itemSells).forEach(([i, cnt]) =>
-                        itemSells.set(item_id(i), cnt));
-                    ppi.item_sells = itemSells;
+                        item_sells.set(item_id(i), cnt));
+                    ppi.item_sells = item_sells;
 
                     // csv for backwards compatibility (TODO)
                     try {
@@ -454,15 +458,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                     pas.itemSells = Object.keys(pas.itemSells)
                         .map((key) => item_id(key) + ";" + pas.itemSells[key]).join(",");
 
-                    participant.player.attributes.shardId = participant.player.attributes.shardId
-                        || participant.attributes.shardId;
-                    if (participant.player.attributes.createdAt != undefined)
-                        participant.player.attributes.createdAt =
-                            new Date(Date.parse(participant.player.attributes.createdAt));
-                    else participant.player.attributes.created_at = participant.createdAt;
+                    participant.player.shard_id = participant.player.shard_id
+                        || participant.shard_id;
+                    if (participant.player.created_at != undefined)
+                        participant.player.created_at =
+                            new Date(Date.parse(participant.player.created_at));
+                    else participant.player.created_at = participant.created_at;
 
-                    // `flatten` will only flatten what is in `.attributes` & meta data
-                    ppi = flatten(ppi);
                     participant.player = flatten(participant.player);
                     return flatten(participant);
                 });
@@ -470,8 +472,8 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             });
             match.assets = match.assets.map((asset) => {
                 asset.id = uuidfy(asset.id);
-                asset.matchApiId = match.id;
-                asset.attributes.shardId = asset.attributes.shardId || match.attributes.shardId;
+                asset.match_api_id = match.id;
+                asset.shard_id = asset.shard_id || match.shard_id;
                 return flatten(asset);
             });
             match = flatten(match);
@@ -594,13 +596,19 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
-                        "level", "lifetime_gold", "xp"
+                        "level", "xp",
+                        "guild_tag",
+                        "rank_points_blitz", "rank_points_ranked",
+                        "played_aral", "played_blitz", "played_casual", "played_ranked"
                     ],
                     updateOnDuplicate: [
                         "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
-                        "level", "lifetime_gold", "xp"
+                        "level", "xp",
+                        "guild_tag",
+                        "rank_points_blitz", "rank_points_ranked",
+                        "played_aral", "played_blitz", "played_casual", "played_ranked"
                     ],
                     transaction: transaction
                 }), { concurrency: MAXCONNS }
@@ -612,14 +620,20 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
-                        "level", "lifetime_gold", "xp"
+                        "level", "xp",
+                        "guild_tag",
+                        "rank_points_blitz", "rank_points_ranked",
+                        "played_aral", "played_blitz", "played_casual", "played_ranked"
                     ],
                     updateOnDuplicate: [
                         "last_update", "last_match_created_date",
                         "created_at",
                         "api_id", "name", "shard_id",
                         "skill_tier",
-                        "level", "lifetime_gold", "xp"
+                        "level", "xp",
+                        "guild_tag",
+                        "rank_points_blitz", "rank_points_ranked",
+                        "played_aral", "played_blitz", "played_casual", "played_ranked"
                     ],
                     transaction: transaction
                 }), { concurrency: MAXCONNS }
