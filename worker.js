@@ -82,12 +82,13 @@ function flatten(o) {
         o.rank_points_blitz = o.rank_points.blitz || 0;
         delete o.rank_points;
     }
-    if ("games" in o) {
-        o.played_ranked = o.games.ranked || 0;
-        o.played_casual = o.games.casual || 0;
-        o.played_blitz = o.games.blitz || 0;
-        o.played_aral = o.games.aral || 0;
-        delete o.games;
+    if ("games_played" in o) {
+        o.played_ranked = o.games_played.ranked || 0;
+        o.played_casual = o.games_played.casual || 0;
+        o.played_blitz = o.games_played.blitz || 0;
+        o.played_blitz_rounds = o.games_played.blitz_rounds || 0;
+        o.played_aral = o.games_played.aral || 0;
+        delete o.games_played;
     }
     delete o.type;
     return o;
