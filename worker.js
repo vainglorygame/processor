@@ -623,7 +623,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         "level", "xp",
                         "guild_tag",
                         "rank_points_blitz", "rank_points_ranked",
-                        "played_aral", "played_blitz", "played_casual", "played_ranked"
+                        "played_aral", "played_blitz", "played_blitz_rounds", "played_casual", "played_ranked"
                     ],
                     updateOnDuplicate: [
                         "last_update", "last_match_created_date",
@@ -633,7 +633,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
                         "level", "xp",
                         "guild_tag",
                         "rank_points_blitz", "rank_points_ranked",
-                        "played_aral", "played_blitz", "played_casual", "played_ranked"
+                        "played_aral", "played_blitz", "played_blitz_rounds", "played_casual", "played_ranked"
                     ],
                     transaction: transaction
                 }), { concurrency: MAXCONNS }
