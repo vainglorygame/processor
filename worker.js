@@ -374,6 +374,10 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             let match = JSON.parse(JSON.stringify(msg.content));  // deep clone
             match.id = uuidfy(match.id);
             match.created_at = new Date(Date.parse(match.created_at));
+            if (!api_name_mappings.has(match.game_mode)) {
+                throw `API mappings is missing game mode ${match.game_mode}, affected match: ${match.shard_id}/${match.id}`;
+            }
+            match.game_mode = api_name_mappings.get(match.game_mode);  // TODO db col is only 16 bytes, some modes are 33 chars -> map to shorter name
 
             // flatten jsonapi nested response into our db structure-like shape
             // also, push missing fields
