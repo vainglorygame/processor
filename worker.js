@@ -290,15 +290,13 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
             // notify follow up services
             if (DOANALYZEMATCH) {
                 await Promise.each(match_objects, async (msg) => {
-                    if (["casual", "ranked"].includes(msg.content.game_mode)) {
-                        await ch.publish("amq.topic", msg.properties.headers.notify,
-                            new Buffer("analyze_pending"));
-                        await ch.sendToQueue(ANALYZE_QUEUE,
-                            new Buffer(msg.content.id), {
-                                persistent: true,
-                                headers: { notify: msg.properties.headers.notify }
-                            });
-                    }
+                    await ch.publish("amq.topic", msg.properties.headers.notify,
+                        new Buffer("analyze_pending"));
+                    await ch.sendToQueue(ANALYZE_QUEUE,
+                        new Buffer(msg.content.id), {
+                            persistent: true,
+                            headers: { notify: msg.properties.headers.notify }
+                        });
                 });
             }
         } catch (err) {
