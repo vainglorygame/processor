@@ -664,7 +664,7 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         // items - simple, has been prepared in `process()` already (grep for `ppi`)
         p_i = participant.participant_items;
         // not really "item", but I need this one
-        p_i.surrendered = (match.end_game_reason == "surrender" && participant.winner == false);
+        p_i.surrender = (match.end_game_reason == "surrender" && participant.winner == false);
         p_i.participant_api_id = participant.api_id;
 
         // meta
