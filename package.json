@@ -5,6 +5,7 @@
   "main": "model.js",
   "dependencies": {
     "amqplib": "^0.5.1",
+    "bluebird": "^3.5.1",
     "lodash.snakecase": "^4.1.1",
     "mysql2": "^1.4.2",
     "sequelize": "^4.10.2",
