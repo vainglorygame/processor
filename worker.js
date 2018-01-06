@@ -12,6 +12,7 @@ const amqp = require("amqplib"),
     Promise = require("bluebird"),
     uuidV4 = require("uuid/v4"),
     winston = require("winston"),
+    datadog = require("winston-datadog"),
     loggly = require("winston-loggly-bulk"),
     _snakecase = require("lodash/snakeCase"),
     Seq = require("sequelize"),
@@ -21,6 +22,7 @@ const RABBITMQ_URI = process.env.RABBITMQ_URI,
     DATABASE_URI = process.env.DATABASE_URI,
     QUEUE = process.env.QUEUE || "process",
     LOGGLY_TOKEN = process.env.LOGGLY_TOKEN,
+    DATADOG_TOKEN = process.env.DATADOG_TOKEN,
     // matches + players, 5 players with 50 matches as default
     BATCHSIZE = parseInt(process.env.BATCHSIZE) || 5 * (50 + 1),
     // maximum number of elements to be inserted in one statement
@@ -48,6 +50,12 @@ if (LOGGLY_TOKEN)
         tags: ["backend", "processor", QUEUE],
         json: true
     });
+
+// datadog integration
+if (DATADOG_TOKEN)
+    logger.add(new datadog({
+        api_key: DATADOG_TOKEN
+    }), null, true);
 
 // MadGlory API uses snakeCase, our db uses camel_case
 function snakeCaseKeys(obj) {
