@@ -748,12 +748,12 @@ amqp.connect(RABBITMQ_URI).then(async (rabbit) => {
         return [p, p_s, p_i];
     }
 
-    // return "captain" "carry" "jungler"
+    // return "captain" "carry" "jungler" "unknown"
     function classify_role(participant_stats, participant) {
         // override Brawl, proper roles aren't defined yet
         if (participant.game_mode_id == game_mode_db_map.get("blitz_pvp_ranked") ||
             participant.game_mode_id == game_mode_db_map.get("casual_aral")) {
-            return "all";
+            return "unknown";
         }
 
         const is_captain_score = 2.34365487 + (-0.06188674 * participant_stats.non_jungle_minion_kills) + (-0.10575069 * participant_stats.jungle_kills),  // about 88% accurate, trained on Hero.is_captain
