@@ -88,7 +88,9 @@ function flatten(o) {
     }
     if ("games_played" in o) {
         o.played_ranked = o.games_played.ranked || 0;
+        o.played_ranked_5v5 = o.games_played.ranked_5v5 || 0;
         o.played_casual = o.games_played.casual || 0;
+        o.played_casual_5v5 = o.games_played.casual_5v5 || 0;
         o.played_blitz = o.games_played.blitz || 0;
         o.played_blitz_rounds = o.games_played.blitz_rounds || 0;
         o.played_aral = o.games_played.aral || 0;
